@@ -36,9 +36,35 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
 
+# ---------------------------------------------------------------------------
+# Monkey-patch olmocr to avoid poppler CLI dependency (use PyMuPDF instead)
+# ---------------------------------------------------------------------------
+import fitz  # PyMuPDF
+
+def _get_pdf_media_box_width_height(pdf_path, page_num):
+    doc = fitz.open(pdf_path)
+    page = doc[page_num - 1]
+    rect = page.mediabox
+    doc.close()
+    return rect.width, rect.height
+
+def render_pdf_to_base64png(pdf_path, page_num, target_longest_image_dim=1024):
+    doc = fitz.open(pdf_path)
+    page = doc[page_num - 1]
+    rect = page.mediabox
+    longest = max(rect.width, rect.height)
+    zoom = target_longest_image_dim / longest
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    png_bytes = pix.tobytes("png")
+    doc.close()
+    return base64.b64encode(png_bytes).decode("utf-8")
+
+import olmocr.data.renderpdf as _renderpdf
+_renderpdf.get_pdf_media_box_width_height = _get_pdf_media_box_width_height
+_renderpdf.render_pdf_to_base64png = render_pdf_to_base64png
 
 # ---------------------------------------------------------------------------
 # Helpers
