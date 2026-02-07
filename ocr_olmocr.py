@@ -26,7 +26,6 @@ import argparse
 import base64
 import json
 import os
-import subprocess
 import sys
 import time
 from glob import glob
@@ -46,14 +45,9 @@ from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
 # ---------------------------------------------------------------------------
 
 def get_pdf_page_count(pdf_path: str) -> int:
-    """Return the number of pages in a PDF (requires poppler 'pdfinfo')."""
-    result = subprocess.run(
-        ["pdfinfo", pdf_path], capture_output=True, text=True
-    )
-    for line in result.stdout.splitlines():
-        if line.startswith("Pages:"):
-            return int(line.split(":")[1].strip())
-    raise RuntimeError(f"Could not determine page count for {pdf_path}")
+    """Return the number of pages in a PDF."""
+    from pypdf import PdfReader
+    return len(PdfReader(pdf_path).pages)
 
 
 def collect_pdfs(input_path: str) -> list[str]:
