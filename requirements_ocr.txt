@@ -12,3 +12,8 @@
 # transformers
 # Pillow
 # qwen-vl-utils
+
+# Additional required packages
+accelerate
+pypdf
+pymupdf
