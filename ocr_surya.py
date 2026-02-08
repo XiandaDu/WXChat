@@ -31,11 +31,25 @@ import pypdfium2 as pdfium
 import torch
 from PIL import Image
 from pypdf import PdfReader
+from surya.settings import settings
+
+# Fix for newer transformers (>=4.50) where pad_token_id is no longer
+# provided as a default attribute on config objects.
+from surya.common.surya.decoder.config import SuryaDecoderConfig
+
+_orig_decoder_init = SuryaDecoderConfig.__init__
+
+def _patched_decoder_init(self, *args, **kwargs):
+    _orig_decoder_init(self, *args, **kwargs)
+    if not hasattr(self, "pad_token_id"):
+        self.pad_token_id = 0
+
+SuryaDecoderConfig.__init__ = _patched_decoder_init
+
 from surya.detection import DetectionPredictor
 from surya.foundation import FoundationPredictor
 from surya.layout import LayoutPredictor
 from surya.recognition import RecognitionPredictor
-from surya.settings import settings
 
 
 # ---------------------------------------------------------------------------
