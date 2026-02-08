@@ -1,19 +1,8 @@
-# olmOCR dependencies
-# NOTE: Requires Python >= 3.11
+# Surya OCR dependencies
+# NOTE: Requires Python >= 3.10
 
-# --- Pick ONE of the following install lines ---
-# For NVIDIA GPU (recommended):
-#   pip install olmocr[gpu] --extra-index-url https://download.pytorch.org/whl/cu128
-# For CPU / Apple Silicon (slower, no vLLM):
-#   pip install olmocr
+# Core OCR library (includes pypdfium2, torch, Pillow, etc.)
+surya-ocr
 
-# Core dependencies (installed automatically by olmocr)
-# torch
-# transformers
-# Pillow
-# qwen-vl-utils
-
-# Additional required packages
-accelerate
+# PDF page count
 pypdf
-pymupdf
