@@ -1,8 +1,6 @@
-# Surya OCR dependencies
-# NOTE: Requires Python >= 3.10
-
-# Core OCR library (includes pypdfium2, torch, Pillow, etc.)
-surya-ocr
-
-# PDF page count
+# GOT-OCR 2.0 dependencies
+transformers
+torch
+Pillow
+pypdfium2
 pypdf

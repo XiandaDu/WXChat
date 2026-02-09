@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Surya OCR Script for Historical Newspaper PDFs
-===============================================
-Uses Surya OCR (detection + layout + recognition) to extract text
-from scanned historical newspaper pages with column-aware reading order.
+GOT-OCR 2.0 Script for Historical Newspaper PDFs
+=================================================
+Uses GOT-OCR 2.0 (natively in transformers) to extract text from
+scanned historical newspaper pages.
 
 Usage:
     # Process all PDFs in sample_data/
@@ -25,31 +25,13 @@ import os
 import sys
 import time
 from glob import glob
+from io import BytesIO
 from pathlib import Path
 
-import pypdfium2 as pdfium
 import torch
 from PIL import Image
 from pypdf import PdfReader
-from surya.settings import settings
-
-# Fix for newer transformers (>=4.50) where pad_token_id is no longer
-# provided as a default attribute on config objects.
-from surya.common.surya.decoder.config import SuryaDecoderConfig
-
-_orig_decoder_init = SuryaDecoderConfig.__init__
-
-def _patched_decoder_init(self, *args, **kwargs):
-    _orig_decoder_init(self, *args, **kwargs)
-    if not hasattr(self, "pad_token_id"):
-        self.pad_token_id = 0
-
-SuryaDecoderConfig.__init__ = _patched_decoder_init
-
-from surya.detection import DetectionPredictor
-from surya.foundation import FoundationPredictor
-from surya.layout import LayoutPredictor
-from surya.recognition import RecognitionPredictor
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 # ---------------------------------------------------------------------------
@@ -77,9 +59,11 @@ def collect_pdfs(input_path: str) -> list[str]:
 def render_page_to_image(
     pdf_path: str, page_num: int, resolution: int = 1536
 ) -> Image.Image:
-    """Render a single PDF page to a PIL Image using pypdfium2."""
+    """Render a single PDF page to a PIL Image using pypdf."""
+    import pypdfium2 as pdfium
+
     doc = pdfium.PdfDocument(pdf_path)
-    page = doc[page_num - 1]  # 0-indexed
+    page = doc[page_num - 1]
     width, height = page.get_size()
     longest = max(width, height)
     scale = resolution / longest
@@ -93,116 +77,62 @@ def render_page_to_image(
 # Core OCR
 # ---------------------------------------------------------------------------
 
-def load_models():
-    """Load all Surya predictors (models auto-download on first use)."""
-    print("Loading Surya models ...")
-    foundation = FoundationPredictor()
-    det_predictor = DetectionPredictor()
-    rec_predictor = RecognitionPredictor(foundation)
-    layout_predictor = LayoutPredictor(
-        FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
+MODEL_ID = "stepfun-ai/GOT-OCR-2.0-hf"
+
+
+def load_model(device: torch.device):
+    """Load GOT-OCR 2.0 model and processor."""
+    print(f"Loading model: {MODEL_ID} ...")
+    model = AutoModelForImageTextToText.from_pretrained(
+        MODEL_ID, torch_dtype=torch.bfloat16, device_map=str(device)
     )
-    print("Models loaded.\n")
-    return {
-        "detection": det_predictor,
-        "recognition": rec_predictor,
-        "layout": layout_predictor,
-    }
-
-
-def assemble_text_with_layout(rec, layout) -> str:
-    """Use layout regions to group text lines by column, then read in order.
-
-    Layout regions are sorted by their ``position`` field (Surya reading
-    order).  Each recognised text line is assigned to the layout region
-    whose bounding box contains its centre.  Lines that fall outside every
-    region are collected at the end.
-    """
-    text_labels = {
-        "text", "section-header", "title", "caption", "list-item",
-        "page-header", "page-footer", "footnote",
-    }
-    text_regions = [
-        b for b in layout.bboxes if b.label.lower() in text_labels
-    ]
-    # Sort regions by Surya's reading-order position
-    text_regions.sort(key=lambda r: r.position)
-
-    assigned = set()
-    all_parts: list[str] = []
-
-    for region in text_regions:
-        rx1, ry1, rx2, ry2 = region.bbox
-        region_lines = []
-        for idx, line in enumerate(rec.text_lines):
-            if idx in assigned:
-                continue
-            cx = (line.bbox[0] + line.bbox[2]) / 2
-            cy = (line.bbox[1] + line.bbox[3]) / 2
-            if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                region_lines.append(line)
-                assigned.add(idx)
-        # Sort lines within a region top-to-bottom
-        region_lines.sort(key=lambda l: l.bbox[1])
-        text = "\n".join(l.text for l in region_lines)
-        if text.strip():
-            all_parts.append(text)
-
-    # Collect orphan lines not matched to any region
-    orphan_lines = [
-        line for idx, line in enumerate(rec.text_lines) if idx not in assigned
-    ]
-    if orphan_lines:
-        orphan_lines.sort(key=lambda l: (l.bbox[1], l.bbox[0]))
-        all_parts.append("\n".join(l.text for l in orphan_lines))
-
-    return "\n\n".join(all_parts)
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
+    print("Model loaded.\n")
+    return model, processor
 
 
 def ocr_page(
-    predictors: dict,
+    model,
+    processor,
+    device: torch.device,
     pdf_path: str,
     page_num: int,
     resolution: int = 1536,
 ) -> dict:
-    """Run Surya OCR on a single PDF page and return structured output."""
+    """Run GOT-OCR on a single PDF page and return structured output."""
     image = render_page_to_image(pdf_path, page_num, resolution)
 
-    # Layout detection — identifies columns, tables, figures, etc.
-    layout_preds = predictors["layout"]([image])
-    layout = layout_preds[0]
+    inputs = processor(image, return_tensors="pt").to(device)
 
-    has_table = any(
-        b.label.lower() in ("table", "table_of_contents")
-        for b in layout.bboxes
-    )
-    has_diagram = any(
-        b.label.lower() in ("figure", "image", "picture")
-        for b in layout.bboxes
+    generate_ids = model.generate(
+        **inputs,
+        do_sample=False,
+        tokenizer=processor.tokenizer,
+        stop_strings="<|im_end|>",
+        max_new_tokens=8192,
     )
 
-    # Text detection + recognition
-    rec_preds = predictors["recognition"](
-        [image], det_predictor=predictors["detection"]
+    # Decode only the new tokens
+    prompt_len = inputs["input_ids"].shape[1]
+    raw_text = processor.decode(
+        generate_ids[0, prompt_len:], skip_special_tokens=True
     )
-    rec = rec_preds[0]
-
-    # Assemble text using layout-aware reading order
-    natural_text = assemble_text_with_layout(rec, layout)
 
     return {
         "page": page_num,
         "primary_language": "en",
         "is_rotation_valid": True,
         "rotation_correction": 0,
-        "is_table": has_table,
-        "is_diagram": has_diagram,
-        "natural_text": natural_text,
+        "is_table": False,
+        "is_diagram": False,
+        "natural_text": raw_text.strip(),
     }
 
 
 def ocr_pdf(
-    predictors: dict,
+    model,
+    processor,
+    device: torch.device,
     pdf_path: str,
     resolution: int = 1536,
 ) -> list[dict]:
@@ -213,7 +143,9 @@ def ocr_pdf(
     results = []
     for page_num in range(1, num_pages + 1):
         t0 = time.time()
-        page_result = ocr_page(predictors, pdf_path, page_num, resolution)
+        page_result = ocr_page(
+            model, processor, device, pdf_path, page_num, resolution
+        )
         elapsed = time.time() - t0
         print(f"  Page {page_num}/{num_pages} done ({elapsed:.1f}s)")
         results.append(page_result)
@@ -230,7 +162,6 @@ def save_results(pdf_path: str, pages: list[dict], output_dir: str):
     stem = Path(pdf_path).stem
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- Full structured JSON ---
     json_path = os.path.join(output_dir, f"{stem}.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(
@@ -240,7 +171,6 @@ def save_results(pdf_path: str, pages: list[dict], output_dir: str):
             indent=2,
         )
 
-    # --- Plain text (just the natural_text from each page) ---
     txt_path = os.path.join(output_dir, f"{stem}.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         for page in pages:
@@ -257,7 +187,7 @@ def save_results(pdf_path: str, pages: list[dict], output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OCR historical newspaper PDFs with Surya"
+        description="OCR historical newspaper PDFs with GOT-OCR 2.0"
     )
     parser.add_argument(
         "--input",
@@ -279,18 +209,20 @@ def main():
     args = parser.parse_args()
 
     if torch.cuda.is_available():
+        device = torch.device("cuda")
         print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
     else:
+        device = torch.device("cpu")
         print("WARNING: No GPU detected — inference will be very slow on CPU.")
 
     pdf_files = collect_pdfs(args.input)
     print(f"Found {len(pdf_files)} PDF(s) to process.\n")
 
-    predictors = load_models()
+    model, processor = load_model(device)
 
     for i, pdf_path in enumerate(pdf_files, 1):
         print(f"[{i}/{len(pdf_files)}] {os.path.basename(pdf_path)}")
-        pages = ocr_pdf(predictors, pdf_path, args.resolution)
+        pages = ocr_pdf(model, processor, device, pdf_path, args.resolution)
         save_results(pdf_path, pages, args.output)
         print()
 
