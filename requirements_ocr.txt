@@ -1,4 +1,0 @@
-# OCR pipeline dependencies
-easyocr
-pypdfium2
-pypdf
