@@ -1,6 +1,4 @@
-# GOT-OCR 2.0 dependencies
-transformers
-torch
-Pillow
+# OCR pipeline dependencies
+easyocr
 pypdfium2
 pypdf

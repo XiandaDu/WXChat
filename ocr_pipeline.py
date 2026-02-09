@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
-GOT-OCR 2.0 Script for Historical Newspaper PDFs
-=================================================
-Uses GOT-OCR 2.0 (natively in transformers) to extract text from
-scanned historical newspaper pages.
+OCR Pipeline for Historical Newspaper PDFs
+===========================================
+Uses EasyOCR (CRAFT detection + CRNN recognition) to extract text
+from scanned historical newspaper pages.
 
 Usage:
-    # Process all PDFs in sample_data/
-    python ocr_surya.py
-
-    # Process a specific PDF
-    python ocr_surya.py --input sample_data/1886-11-01_The-Liverpool-Echo_Monday_p01.pdf
-
-    # Process a folder of PDFs
-    python ocr_surya.py --input sample_data/
-
-    # Use higher resolution for dense small text
-    python ocr_surya.py --resolution 2048
+    python ocr_pipeline.py
+    python ocr_pipeline.py --input sample_data/1886-11-01_The-Liverpool-Echo_Monday_p01.pdf
+    python ocr_pipeline.py --input sample_data/
+    python ocr_pipeline.py --resolution 2048
 """
 
 import argparse
@@ -25,13 +18,13 @@ import os
 import sys
 import time
 from glob import glob
-from io import BytesIO
 from pathlib import Path
 
-import torch
+import easyocr
+import numpy as np
+import pypdfium2 as pdfium
 from PIL import Image
 from pypdf import PdfReader
-from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 # ---------------------------------------------------------------------------
@@ -58,10 +51,8 @@ def collect_pdfs(input_path: str) -> list[str]:
 
 def render_page_to_image(
     pdf_path: str, page_num: int, resolution: int = 1536
-) -> Image.Image:
-    """Render a single PDF page to a PIL Image using pypdf."""
-    import pypdfium2 as pdfium
-
+) -> np.ndarray:
+    """Render a single PDF page to a numpy array using pypdfium2."""
     doc = pdfium.PdfDocument(pdf_path)
     page = doc[page_num - 1]
     width, height = page.get_size()
@@ -70,53 +61,34 @@ def render_page_to_image(
     bitmap = page.render(scale=scale)
     pil_image = bitmap.to_pil()
     doc.close()
-    return pil_image
+    return np.array(pil_image)
 
 
 # ---------------------------------------------------------------------------
 # Core OCR
 # ---------------------------------------------------------------------------
 
-MODEL_ID = "stepfun-ai/GOT-OCR-2.0-hf"
-
-
-def load_model(device: torch.device):
-    """Load GOT-OCR 2.0 model and processor."""
-    print(f"Loading model: {MODEL_ID} ...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        MODEL_ID, torch_dtype=torch.bfloat16, device_map=str(device)
-    )
-    processor = AutoProcessor.from_pretrained(MODEL_ID)
-    print("Model loaded.\n")
-    return model, processor
+def load_reader(languages: list[str], gpu: bool = True) -> easyocr.Reader:
+    """Initialise the EasyOCR reader."""
+    print(f"Loading EasyOCR (languages={languages}, gpu={gpu}) ...")
+    reader = easyocr.Reader(languages, gpu=gpu)
+    print("Reader loaded.\n")
+    return reader
 
 
 def ocr_page(
-    model,
-    processor,
-    device: torch.device,
+    reader: easyocr.Reader,
     pdf_path: str,
     page_num: int,
     resolution: int = 1536,
 ) -> dict:
-    """Run GOT-OCR on a single PDF page and return structured output."""
-    image = render_page_to_image(pdf_path, page_num, resolution)
+    """Run EasyOCR on a single PDF page and return structured output."""
+    img = render_page_to_image(pdf_path, page_num, resolution)
 
-    inputs = processor(image, return_tensors="pt").to(device)
+    # EasyOCR returns list of (bbox, text, confidence)
+    results = reader.readtext(img, paragraph=True)
 
-    generate_ids = model.generate(
-        **inputs,
-        do_sample=False,
-        tokenizer=processor.tokenizer,
-        stop_strings="<|im_end|>",
-        max_new_tokens=8192,
-    )
-
-    # Decode only the new tokens
-    prompt_len = inputs["input_ids"].shape[1]
-    raw_text = processor.decode(
-        generate_ids[0, prompt_len:], skip_special_tokens=True
-    )
+    natural_text = "\n".join(text for _, text, _ in results)
 
     return {
         "page": page_num,
@@ -125,14 +97,12 @@ def ocr_page(
         "rotation_correction": 0,
         "is_table": False,
         "is_diagram": False,
-        "natural_text": raw_text.strip(),
+        "natural_text": natural_text.strip(),
     }
 
 
 def ocr_pdf(
-    model,
-    processor,
-    device: torch.device,
+    reader: easyocr.Reader,
     pdf_path: str,
     resolution: int = 1536,
 ) -> list[dict]:
@@ -143,9 +113,7 @@ def ocr_pdf(
     results = []
     for page_num in range(1, num_pages + 1):
         t0 = time.time()
-        page_result = ocr_page(
-            model, processor, device, pdf_path, page_num, resolution
-        )
+        page_result = ocr_page(reader, pdf_path, page_num, resolution)
         elapsed = time.time() - t0
         print(f"  Page {page_num}/{num_pages} done ({elapsed:.1f}s)")
         results.append(page_result)
@@ -187,7 +155,7 @@ def save_results(pdf_path: str, pages: list[dict], output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OCR historical newspaper PDFs with GOT-OCR 2.0"
+        description="OCR historical newspaper PDFs with EasyOCR"
     )
     parser.add_argument(
         "--input",
@@ -203,26 +171,35 @@ def main():
         "--resolution",
         type=int,
         default=1536,
-        help="Longest-side pixel dimension for page rendering (default: 1536). "
-             "Use 2048 for very dense small text.",
+        help="Longest-side pixel dimension for page rendering (default: 1536).",
+    )
+    parser.add_argument(
+        "--languages",
+        nargs="+",
+        default=["en"],
+        help="Language codes for OCR (default: en).",
     )
     args = parser.parse_args()
 
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-        print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
-    else:
-        device = torch.device("cpu")
-        print("WARNING: No GPU detected — inference will be very slow on CPU.")
+    gpu = False
+    try:
+        import torch
+        gpu = torch.cuda.is_available()
+        if gpu:
+            print(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+        else:
+            print("No GPU detected — using CPU.")
+    except ImportError:
+        print("PyTorch not found — using CPU.")
 
     pdf_files = collect_pdfs(args.input)
     print(f"Found {len(pdf_files)} PDF(s) to process.\n")
 
-    model, processor = load_model(device)
+    reader = load_reader(args.languages, gpu=gpu)
 
     for i, pdf_path in enumerate(pdf_files, 1):
         print(f"[{i}/{len(pdf_files)}] {os.path.basename(pdf_path)}")
-        pages = ocr_pdf(model, processor, device, pdf_path, args.resolution)
+        pages = ocr_pdf(reader, pdf_path, args.resolution)
         save_results(pdf_path, pages, args.output)
         print()
 
