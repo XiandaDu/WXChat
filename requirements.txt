@@ -6,3 +6,4 @@ pytesseract>=0.3.10
 opencv-python-headless>=4.8.0
 scipy>=1.11.0
 pypdf>=4.0.0
+openai>=1.0.0
