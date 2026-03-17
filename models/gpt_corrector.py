@@ -6,12 +6,15 @@ GPT Corrector
 Uses OpenAI's GPT API for contextual OCR post-correction.
 Chunks large texts, sends each through the LLM with a correction
 prompt, and reassembles the corrected output.
+
+Supports parallel chunk processing via an external ThreadPoolExecutor.
 """
 
 import os
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 
 import tiktoken
@@ -36,7 +39,8 @@ class GPTCorrector:
         model: str = "gpt-4o-mini",
         api_key: str | None = None,
         max_retries: int = 3,
-        requests_per_minute: int = 30,
+        requests_per_minute: int = 10000,
+        executor: ThreadPoolExecutor | None = None,
     ):
         """
         Args:
@@ -44,11 +48,14 @@ class GPTCorrector:
             api_key: OpenAI API key. Falls back to OPENAI_API_KEY env var.
             max_retries: Number of retries on transient API errors.
             requests_per_minute: Rate limit for API calls.
+            executor: Shared thread pool for parallel chunk processing.
+                      If None, chunks are processed sequentially.
         """
         self.model = model
         self.max_retries = max_retries
         self.min_interval = 60.0 / requests_per_minute
         self._last_request_time = 0.0
+        self._executor = executor
 
         key = api_key or os.environ.get("OPENAI_API_KEY")
         if not key:
@@ -76,7 +83,11 @@ class GPTCorrector:
         return prompt_file.read_text(encoding="utf-8").strip()
 
     def correct(self, text: str) -> str:
-        """Correct the full text, chunking if necessary."""
+        """Correct the full text, chunking if necessary.
+
+        If an executor was provided, chunks are submitted in parallel.
+        Otherwise falls back to sequential processing.
+        """
         if not text.strip():
             return text
 
@@ -84,14 +95,39 @@ class GPTCorrector:
         if len(chunks) == 1:
             return self._correct_chunk(chunks[0])
 
+        if self._executor is not None:
+            return self._correct_parallel(chunks, separators)
+        return self._correct_sequential(chunks, separators)
+
+    def _correct_sequential(self, chunks: list[str], separators: list[str]) -> str:
+        """Process chunks one by one (legacy behavior)."""
         corrected_chunks = []
         for i, chunk in enumerate(chunks):
             logger.info(f"  GPT correcting chunk {i+1}/{len(chunks)} "
                         f"({len(chunk)} chars)")
             corrected = self._correct_chunk(chunk)
             corrected_chunks.append(corrected)
+        return self._reassemble(corrected_chunks, separators)
 
-        # Reassemble using the original separators between chunks
+    def _correct_parallel(self, chunks: list[str], separators: list[str]) -> str:
+        """Submit all chunks to the shared thread pool and wait for results."""
+        logger.info(f"  GPT correcting {len(chunks)} chunks in parallel")
+        futures: list[Future] = []
+        for chunk in chunks:
+            futures.append(self._executor.submit(self._correct_chunk, chunk))
+
+        corrected_chunks = []
+        for i, future in enumerate(futures):
+            try:
+                corrected_chunks.append(future.result())
+            except Exception as e:
+                logger.error(f"  Chunk {i+1}/{len(chunks)} failed: {e}. Keeping original.")
+                corrected_chunks.append(chunks[i])
+        return self._reassemble(corrected_chunks, separators)
+
+    @staticmethod
+    def _reassemble(corrected_chunks: list[str], separators: list[str]) -> str:
+        """Reassemble chunks using original separators."""
         result = corrected_chunks[0]
         for sep, chunk in zip(separators, corrected_chunks[1:]):
             result += sep + chunk

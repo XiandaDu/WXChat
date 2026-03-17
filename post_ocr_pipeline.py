@@ -49,6 +49,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -338,6 +339,8 @@ def build_pipeline(
     skip_gpt: bool,
     gpt_model: str,
     api_key: str | None,
+    rpm: int = 10000,
+    executor: ThreadPoolExecutor | None = None,
 ):
     """Build the ordered list of correction stages."""
     stages = []
@@ -354,7 +357,12 @@ def build_pipeline(
         try:
             from models.gpt_corrector import GPTCorrector
 
-            stages.append(("gpt", GPTCorrector(model=gpt_model, api_key=api_key)))
+            stages.append(("gpt", GPTCorrector(
+                model=gpt_model,
+                api_key=api_key,
+                requests_per_minute=rpm,
+                executor=executor,
+            )))
         except ValueError as e:
             logger.warning(f"GPT stage disabled: {e}")
         except FileNotFoundError as e:
@@ -427,159 +435,173 @@ def run_pipeline(
     hf_repo: str | None,
     hf_token: str | None,
     snapshot_interval: float,
+    rpm: int = 10000,
 ):
     """Execute the multi-threaded correction pipeline with crash recovery."""
     logger.info(f"Input:   {input_path}")
     logger.info(f"Output:  {output_path}")
     logger.info(f"Era:     {era}")
     logger.info(f"Workers: {num_workers}")
+    logger.info(f"RPM:     {rpm}")
 
-    # Build correction stages
-    stages = build_pipeline(era, skip_regex, skip_gpt, gpt_model, api_key)
-    stage_names = [name for name, _ in stages]
-    logger.info(f"Stages:  {' -> '.join(stage_names)}")
+    # A single shared thread pool handles both row-level and chunk-level
+    # parallelism.  Row workers submit their chunks into the same pool,
+    # so idle time waiting for API responses is filled by other rows'
+    # chunks — maximising throughput up to the RPM limit.
+    with ExitStack() as stack:
+        chunk_pool = stack.enter_context(
+            ThreadPoolExecutor(max_workers=num_workers)
+        ) if not skip_gpt else None
 
-    # Progress tracker for crash recovery
-    cfg_hash = compute_config_hash(
-        input_path, era, skip_regex, skip_gpt, gpt_model, row_start, row_end
-    )
-    tracker = ProgressTracker(output_path, cfg_hash)
+        # Build correction stages (GPTCorrector receives the shared pool)
+        stages = build_pipeline(
+            era, skip_regex, skip_gpt, gpt_model, api_key,
+            rpm=rpm, executor=chunk_pool,
+        )
+        stage_names = [name for name, _ in stages]
+        logger.info(f"Stages:  {' -> '.join(stage_names)}")
 
-    if fresh:
-        tracker.reset()
-        logger.info("Fresh start: cleared previous progress.")
+        # Progress tracker for crash recovery
+        cfg_hash = compute_config_hash(
+            input_path, era, skip_regex, skip_gpt, gpt_model, row_start, row_end
+        )
+        tracker = ProgressTracker(output_path, cfg_hash)
 
-    # Load existing progress (if any)
-    completed = tracker.load()
+        if fresh:
+            tracker.reset()
+            logger.info("Fresh start: cleared previous progress.")
 
-    # Load input data
-    logger.info("Loading data...")
-    all_rows = load_rows(input_path, row_start, row_end)
-    total = len(all_rows)
-    logger.info(f"Loaded {total} rows (range: {row_start}-{row_start + total})")
+        # Load existing progress (if any)
+        completed = tracker.load()
 
-    if total == 0:
-        logger.warning("No rows to process.")
-        return
+        # Load input data
+        logger.info("Loading data...")
+        all_rows = load_rows(input_path, row_start, row_end)
+        total = len(all_rows)
+        logger.info(f"Loaded {total} rows (range: {row_start}-{row_start + total})")
 
-    # Filter out already-completed rows
-    pending_rows = [r for r in all_rows if r["row_idx"] not in completed]
-    already_done = total - len(pending_rows)
+        if total == 0:
+            logger.warning("No rows to process.")
+            return
 
-    if already_done > 0:
+        # Filter out already-completed rows
+        pending_rows = [r for r in all_rows if r["row_idx"] not in completed]
+        already_done = total - len(pending_rows)
+
+        if already_done > 0:
+            logger.info(
+                f"Resuming: {already_done} rows already done, "
+                f"{len(pending_rows)} remaining"
+            )
+
+        if not pending_rows:
+            logger.info("All rows already processed. Writing final output.")
+            _write_final_output(all_rows, completed, output_path)
+            tracker.cleanup()
+            return
+
+        # Save state for future resume
+        tracker.save_state(total, row_start, row_end)
+
+        # HuggingFace snapshotter
+        snapshotter = None
+        if hf_repo:
+            token = hf_token or os.environ.get("HUGGINGFACE_TOKEN")
+            if not token:
+                logger.warning(
+                    "HuggingFace snapshots disabled: no token found. "
+                    "Set HUGGINGFACE_TOKEN in .env or pass --hf-token."
+                )
+            else:
+                snapshotter = HuggingFaceSnapshotter(
+                    repo_id=hf_repo,
+                    token=token,
+                    output_path=output_path,
+                    interval_hours=snapshot_interval,
+                )
+                snapshotter.start()
+
+        # Process rows with thread pool
+        t_start = time.time()
+        done_count = already_done
+        failed_count = 0
+        checkpoint_counter = 0
+
+        try:
+            with ThreadPoolExecutor(max_workers=num_workers) as row_executor:
+                # Submit all pending rows
+                future_to_row = {
+                    row_executor.submit(process_row, row, stages): row
+                    for row in pending_rows
+                }
+
+                for future in as_completed(future_to_row):
+                    row = future_to_row[future]
+                    row_idx = row["row_idx"]
+
+                    try:
+                        result = future.result()
+                        tracker.record(result["row_idx"], result["date"], result["text"])
+                        done_count += 1
+
+                        delta = result["original_len"] - len(result["text"])
+
+                        # Progress logging every 10 rows or on the last row
+                        if done_count % 10 == 0 or done_count == total:
+                            elapsed = time.time() - t_start
+                            processed = done_count - already_done
+                            rate = processed / elapsed if elapsed > 0 else 0
+                            remaining = total - done_count
+                            eta = remaining / rate if rate > 0 else 0
+                            logger.info(
+                                f"  [{done_count}/{total}] row {row_idx} | "
+                                f"{result['original_len']:,} -> {len(result['text']):,} "
+                                f"(delta: {delta:+,}) | {rate:.1f} rows/s | ETA: {eta:.0f}s"
+                            )
+
+                    except Exception as e:
+                        logger.error(
+                            f"  Row {row_idx} ({row['date']}) failed: {e}. "
+                            "Keeping original text."
+                        )
+                        tracker.record(row_idx, row["date"], row["text"])
+                        done_count += 1
+                        failed_count += 1
+
+                    # Periodic checkpoint: write output CSV
+                    checkpoint_counter += 1
+                    if (
+                        checkpoint_interval > 0
+                        and checkpoint_counter % checkpoint_interval == 0
+                    ):
+                        logger.info(f"  Checkpoint: saving {done_count} rows...")
+                        _write_intermediate_output(all_rows, tracker, output_path)
+
+        except KeyboardInterrupt:
+            logger.warning("Interrupted! Progress saved. Re-run the same command to resume.")
+            _write_intermediate_output(all_rows, tracker, output_path)
+            if snapshotter:
+                snapshotter.stop()
+            return
+
+        # Final output
+        elapsed = time.time() - t_start
         logger.info(
-            f"Resuming: {already_done} rows already done, "
-            f"{len(pending_rows)} remaining"
+            f"Pipeline complete in {elapsed:.1f}s "
+            f"({total} rows, {failed_count} failed)"
         )
 
-    if not pending_rows:
-        logger.info("All rows already processed. Writing final output.")
-        _write_final_output(all_rows, completed, output_path)
-        tracker.cleanup()
-        return
+        _write_final_output(all_rows, tracker.get_all_completed(), output_path)
 
-    # Save state for future resume
-    tracker.save_state(total, row_start, row_end)
-
-    # HuggingFace snapshotter
-    snapshotter = None
-    if hf_repo:
-        token = hf_token or os.environ.get("HUGGINGFACE_TOKEN")
-        if not token:
-            logger.warning(
-                "HuggingFace snapshots disabled: no token found. "
-                "Set HUGGINGFACE_TOKEN in .env or pass --hf-token."
-            )
-        else:
-            snapshotter = HuggingFaceSnapshotter(
-                repo_id=hf_repo,
-                token=token,
-                output_path=output_path,
-                interval_hours=snapshot_interval,
-            )
-            snapshotter.start()
-
-    # Process rows with thread pool
-    t_start = time.time()
-    done_count = already_done
-    failed_count = 0
-    checkpoint_counter = 0
-
-    try:
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # Submit all pending rows
-            future_to_row = {
-                executor.submit(process_row, row, stages): row
-                for row in pending_rows
-            }
-
-            for future in as_completed(future_to_row):
-                row = future_to_row[future]
-                row_idx = row["row_idx"]
-
-                try:
-                    result = future.result()
-                    tracker.record(result["row_idx"], result["date"], result["text"])
-                    done_count += 1
-
-                    delta = result["original_len"] - len(result["text"])
-
-                    # Progress logging every 10 rows or on the last row
-                    if done_count % 10 == 0 or done_count == total:
-                        elapsed = time.time() - t_start
-                        processed = done_count - already_done
-                        rate = processed / elapsed if elapsed > 0 else 0
-                        remaining = total - done_count
-                        eta = remaining / rate if rate > 0 else 0
-                        logger.info(
-                            f"  [{done_count}/{total}] row {row_idx} | "
-                            f"{result['original_len']:,} -> {len(result['text']):,} "
-                            f"(delta: {delta:+,}) | {rate:.1f} rows/s | ETA: {eta:.0f}s"
-                        )
-
-                except Exception as e:
-                    logger.error(
-                        f"  Row {row_idx} ({row['date']}) failed: {e}. "
-                        "Keeping original text."
-                    )
-                    tracker.record(row_idx, row["date"], row["text"])
-                    done_count += 1
-                    failed_count += 1
-
-                # Periodic checkpoint: write output CSV
-                checkpoint_counter += 1
-                if (
-                    checkpoint_interval > 0
-                    and checkpoint_counter % checkpoint_interval == 0
-                ):
-                    logger.info(f"  Checkpoint: saving {done_count} rows...")
-                    _write_intermediate_output(all_rows, tracker, output_path)
-
-    except KeyboardInterrupt:
-        logger.warning("Interrupted! Progress saved. Re-run the same command to resume.")
-        _write_intermediate_output(all_rows, tracker, output_path)
+        # Final HuggingFace snapshot
         if snapshotter:
+            logger.info("Pushing final snapshot to HuggingFace...")
+            snapshotter.push()
             snapshotter.stop()
-        return
 
-    # Final output
-    elapsed = time.time() - t_start
-    logger.info(
-        f"Pipeline complete in {elapsed:.1f}s "
-        f"({total} rows, {failed_count} failed)"
-    )
-
-    _write_final_output(all_rows, tracker.get_all_completed(), output_path)
-
-    # Final HuggingFace snapshot
-    if snapshotter:
-        logger.info("Pushing final snapshot to HuggingFace...")
-        snapshotter.push()
-        snapshotter.stop()
-
-    # Clean up progress files on success
-    tracker.cleanup()
-    logger.info(f"Saved to {output_path}")
+        # Clean up progress files on success
+        tracker.cleanup()
+        logger.info(f"Saved to {output_path}")
 
 
 def main():
@@ -660,6 +682,12 @@ def main():
         default=12.0,
         help="Hours between HuggingFace snapshots (default: 12.0 = twice daily).",
     )
+    parser.add_argument(
+        "--rpm",
+        type=int,
+        default=10000,
+        help="OpenAI API rate limit in requests per minute (default: 10000).",
+    )
     args = parser.parse_args()
 
     # Validate input
@@ -695,6 +723,7 @@ def main():
         hf_repo=args.hf_repo,
         hf_token=args.hf_token,
         snapshot_interval=args.snapshot_interval,
+        rpm=args.rpm,
     )
 
 
